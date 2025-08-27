@@ -1,0 +1,317 @@
+# act push --secret-file .secrets --env-file .env
+
+name: Pipeline CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOCKER_IMAGE_NAME: devsecops-hackathon
+
+jobs:
+  # ------------------------------------------------------------------------------------------------
+  #   CI
+  # ------------------------------------------------------------------------------------------------
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Gerar nome da tag única
+        id: tag
+        run: |
+          echo $GITHUB_REF
+          GITHUB_REF="${GITHUB_REF:-refs/heads/local}"
+          GITHUB_SHA="${GITHUB_SHA:-$(git rev-parse --short=10 HEAD 2>/dev/null || echo localsha$(date +%s))}"
+          GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER:-$(date +%s)}"
+          GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+          echo "tag_name=release-${GITHUB_REF##*/}-${GITHUB_SHA}-${GITHUB_RUN_NUMBER}-try${GITHUB_RUN_ATTEMPT}" >> $GITHUB_OUTPUT
+
+      - name: Mostrar arquivos
+        run: ls -la
+
+  code_quality:
+    runs-on: ubuntu-latest
+    needs: init
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Instalar Maven
+        run: |
+          apt-get update
+          apt-get install -y maven
+
+      - name: Build com Maven
+        run: mvn clean compile
+
+      - name: Cache SonarCloud
+        uses: actions/cache@v3
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+
+      # Para que a verificação do Sonar inicie pelo pipeline é obrigatório desabilitar a opção "Automatic Analysis" no site do Sonar Cloud
+      - name: Instalar SonarScanner CLI
+        run: |
+          echo $GITHUB_REF
+          wget -O sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip -o sonar-scanner.zip
+          sudo mv sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner
+          sudo ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner
+
+      - name: Análise SonarCloud
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_REF: ${{ env.GITHUB_REF}}
+          GITHUB_HEAD_REF: ${{ env.GITHUB_HEAD_REF}}
+        run: |
+          sonar-scanner -X \
+            -Dsonar.projectKey=leandropsampaio_devsecops-hackathon \
+            -Dsonar.organization=leandropsampaio \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=$SONAR_TOKEN \
+            -Dsonar.branch.name=main \
+            -Dsonar.java.binaries=target/classes \
+
+  sast:
+    runs-on: ubuntu-latest
+    needs: init
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Instalar Semgrep
+        run: pip install semgrep
+
+      - name: Rodar Semgrep
+        run: |
+          semgrep scan \
+            --config=p/owasp-top-ten \
+            --config=p/secrets \
+            --config=p/ci \
+            --config=p/default \
+            --sarif \
+            --sarif-output=reports/semgrep_report.sarif \
+            --verbose
+
+      - name: 🔍 Analisar relatórios SARIF e bloquear pipeline se houver vulnerabilidades
+        continue-on-error: true
+        run: |
+          # Inicializar contador de vulnerabilidades
+          TOTAL_VULNERABILIDADES=0
+
+          # Verificar se o arquivo de relatório do Semgrep existe e contém vulnerabilidades
+          if [ -f reports/semgrep_report.sarif ]; then
+            VULNERABILIDADES_SEMGREP=$(jq '[.runs[].results | length] | add' reports/semgrep_report.sarif || echo 0)
+            echo "Vulnerabilidades detectadas pelo Semgrep: $VULNERABILIDADES_SEMGREP"
+            TOTAL_VULNERABILIDADES=$((TOTAL_VULNERABILIDADES + VULNERABILIDADES_SEMGREP))
+
+            # Exibir detalhes das vulnerabilidades encontradas
+            if [ "$VULNERABILIDADES_SEMGREP" -gt 0 ]; then
+              echo "Detalhes das vulnerabilidades encontradas pelo Semgrep:"
+              jq -r '.runs[].results[] | "- [\(.ruleId)] \(.message.text) (\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine))"' reports/semgrep_report.sarif
+            fi
+          else
+            echo "Relatório do Semgrep não encontrado."
+          fi
+
+          # Exibir o total de vulnerabilidades detectadas
+          echo "Total de vulnerabilidades detectadas: $TOTAL_VULNERABILIDADES"
+
+          # Bloquear a pipeline se houver vulnerabilidades
+          if [ "$TOTAL_VULNERABILIDADES" -gt 0 ]; then
+            echo "Security Gate: Vulnerabilidades encontradas! Bloqueando a pipeline."
+            exit 1
+          else
+            echo "Nenhuma vulnerabilidade encontrada. Prosseguindo com a pipeline."
+          fi
+
+  sca:
+    runs-on: ubuntu-latest
+    needs: init
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Instalar Maven
+        run: |
+          apt-get update
+          apt-get install -y maven
+
+      - name: Baixar dependências Maven
+        run: mvn dependency:resolve
+
+      - name: Criar pasta de relatórios
+        run: mkdir -p reports
+
+      - name: Executar Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "getting-started"
+          args: >
+            --enableExperimental
+            --enableRetired
+            -s .
+            -f SARIF
+            -o reports/dependency-check-report.sarif
+
+      - name: Analisar relatórios SARIF
+        run: |
+          if [ -f reports/dependency-check-report.sarif ]; then
+            echo "Relatório do Dependency-Check encontrado."
+            jq '.runs[].results[] | {ruleId: .ruleId, message: .message.text, location: .locations[0].physicalLocation}' reports/dependency-check-report.sarif
+          else
+            echo "Relatório do Dependency-Check não encontrado."
+          fi
+
+  push_image:
+    runs-on: ubuntu-latest
+    needs: [init, code_quality, sast, sca]
+    # needs: [init]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        # with:
+        #   token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login no Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Definir REPO_OWNER e TAG_NAME
+        run: |
+          echo "REPO_OWNER=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.init.outputs.tag_name }}" >> $GITHUB_ENV
+
+      - name: Build da imagem (utiliza o Dockerfile)
+        run: |
+          docker build -t $REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME .
+
+      - name: Rodar Trivy
+        if: ${{ !env.ACT }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ env.REPO_OWNER }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.TAG_NAME }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "MEDIUM,CRITICAL,HIGH"
+
+      - name: Push da imagem para o Docker Hub
+        run: |
+          docker tag $REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME $REPO_OWNER/$DOCKER_IMAGE_NAME:latest
+          docker push $REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME
+          docker push $REPO_OWNER/$DOCKER_IMAGE_NAME:latest
+
+  # ------------------------------------------------------------------------------------------------
+  #   CD
+  # ------------------------------------------------------------------------------------------------
+  deploy-des:
+    runs-on: ubuntu-latest
+    needs: [init, push_image]
+    environment:
+      name: des
+    steps:
+      - name: Checkout repositório de infra
+        uses: actions/checkout@v3
+        with:
+          repository: leandropsampaio/infra-hackathon
+          path: infra-chart
+
+      - name: Definir variáveis de ambiente
+        run: |
+          echo "REPO_OWNER=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.init.outputs.tag_name }}" >> $GITHUB_ENV
+
+      - name: Instalar kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          rm kubectl
+          kubectl version --client
+
+      - name: Instalar Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Configurar acesso ao cluster Kubernetes
+        run: |
+          kubectl config view
+          echo "TAG_NAME=$TAG_NAME"
+          sed -i 's|image: .*|image: '"$REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME"'|g' ./infra/values-des.yaml
+          cat ./infra/values-des.yaml
+
+      - name: Deploy no ambiente de desenvolvimento (des)
+        run: |
+          helm upgrade --install quarkus-app ./infra-chart \
+            --namespace des \
+            --create-namespace \
+            --values ./infra-chart/values.yaml \
+            --values ./infra/values-des.yaml \
+            --wait --timeout 600s
+
+  # Deploy no ambiente de produção (prd) - vai exigir aprovação manual
+  deploy-prd:
+    runs-on: ubuntu-latest
+    needs: [deploy-des]
+    environment:
+      name: prd
+    steps:
+      - name: Checkout repositório de infra
+        uses: actions/checkout@v3
+        with:
+          repository: leandropsampaio/infra-hackathon
+          path: infra-chart
+
+      - name: Definir variáveis de ambiente
+        run: |
+          echo "REPO_OWNER=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.init.outputs.tag_name }}" >> $GITHUB_ENV
+
+      - name: Instalar kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          rm kubectl
+          kubectl version --client
+
+      - name: Instalar Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Configurar acesso ao cluster Kubernetes
+        run: |
+          kubectl config view
+          kubectl get nodes
+
+      - name: Atualizar valores do Helm Chart com a nova imagem Docker
+        run: |
+          echo "REPO_OWNER=$REPO_OWNER"
+          echo "DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME"
+          echo "TAG_NAME=$TAG_NAME"
+          sed -i 's|image: .*|image: '"$REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME"'|g' ./infra/values-prd.yaml
+          cat infra/values-prd.yaml
+
+      - name: Deploy no ambiente de produção (prd)
+        run: |
+          helm upgrade --install quarkus-app ./infra-chart \
+            --namespace prd \
+            --create-namespace \
+            --values ./infra-chart/values.yaml \
+            --values ./infra/values-prd.yaml \
+            --wait --timeout 600s

@@ -1,0 +1,114 @@
+app:
+  name: quarkus-app
+  replicas: 1
+
+hpa:
+  enabled: true
+  name: quarkus-hpa
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    cpu:
+      averageUtilization: 80
+    memory:
+      averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        percent:
+          value: 100
+          periodSeconds: 60
+        pods:
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        percent:
+          value: 30
+          periodSeconds: 60
+
+deployment:
+  name: quarkus
+  image: leandropsampaio/devsecops-hackathon:release-main-24dbe68e3938a75a3a211d1a531611fdc4085e5b-1-try1
+  imagePullPolicy: IfNotPresent
+  env:
+    quarkusHttpPort: "8080"
+  ports:
+    http:
+      containerPort: 8080
+      name: http
+  # probes:
+  #   readiness:
+  #     path: /q/health/ready
+  #     port: 8080
+  #     initialDelaySeconds: 5
+  #     periodSeconds: 10
+  #     timeoutSeconds: 2
+  #     failureThreshold: 6
+  #   liveness:
+  #     path: /q/health/live
+  #     port: 8080
+  tolerations:
+    - key: "ambiente"
+      operator: "Equal"
+      value: "prd"
+      effect: "NoSchedule"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "500Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+configMap:
+  name: quarkus-configmap
+  data:
+    chave1: valor1
+    chave2: valor2
+    chave3: valor3
+
+service:
+  name: quarkus-service
+  labels:
+    app: quarkus-service
+  type: ClusterIP
+  selector:
+    app: quarkus-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+
+gateway:
+  name: quarkus-gateway
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "*"
+
+virtualService:
+  name: quarkus-virtualservice
+  hosts:
+    - "*"
+  gateways:
+    - quarkus-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /prd/api
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: quarkus-service
+            port: 80

@@ -1,5 +1,3 @@
-# act push --secret-file .secrets --env-file .env
-
 name: Pipeline CI/CD
 
 on:
@@ -172,20 +170,45 @@ jobs:
         run: |
           if [ -f reports/dependency-check-report.sarif ]; then
             echo "Relatório do Dependency-Check encontrado."
-            jq '.runs[].results[] | {ruleId: .ruleId, message: .message.text, location: .locations[0].physicalLocation}' reports/dependency-check-report.sarif
+            echo "=== Conteúdo completo do relatório ==="
+            cat reports/dependency-check-report.sarif | jq .
           else
             echo "Relatório do Dependency-Check não encontrado."
           fi
 
+  iac_security:
+    runs-on: ubuntu-latest
+    needs: init
+    steps:
+      - name: Checkout repositório de infra
+        uses: actions/checkout@v3
+        with:
+          repository: leandropsampaio/infra-hackathon
+          path: infra-chart
+
+      - name: Definir variáveis de ambiente
+        run: |
+          echo "REPO_OWNER=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ needs.init.outputs.tag_name }}" >> $GITHUB_ENV
+
+      - name: Instalar Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          sudo mv ./bin/trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Scan de IaC com Trivy
+        run: trivy config ./infra-chart
+
+      - name: Scan de arquivos do repositório
+        run: trivy fs .
+
   push_image:
     runs-on: ubuntu-latest
-    needs: [init, code_quality, sast, sca]
-    # needs: [init]
+    needs: [init, code_quality, sast, sca, iac_security]
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-        # with:
-        #   token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login no Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
@@ -199,17 +222,6 @@ jobs:
         run: |
           docker build -t $REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME .
 
-      - name: Rodar Trivy
-        if: ${{ !env.ACT }}
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: "${{ env.REPO_OWNER }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.TAG_NAME }}"
-          format: "table"
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: "os,library"
-          severity: "MEDIUM,CRITICAL,HIGH"
-
       - name: Push da imagem para o Docker Hub
         run: |
           docker tag $REPO_OWNER/$DOCKER_IMAGE_NAME:$TAG_NAME $REPO_OWNER/$DOCKER_IMAGE_NAME:latest
@@ -221,10 +233,13 @@ jobs:
   # ------------------------------------------------------------------------------------------------
   deploy-des:
     runs-on: ubuntu-latest
-    needs: [init, push_image]
+    needs: [push_image]
     environment:
       name: des
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
       - name: Checkout repositório de infra
         uses: actions/checkout@v3
         with:
@@ -271,6 +286,9 @@ jobs:
     environment:
       name: prd
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
       - name: Checkout repositório de infra
         uses: actions/checkout@v3
         with:
